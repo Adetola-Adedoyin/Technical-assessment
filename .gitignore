@@ -1,0 +1,37 @@
+# =============================================================================
+# AetherPay — .gitignore
+# =============================================================================
+
+# Terraform state files — never commit these, they can contain plaintext secrets
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Terraform variable files with real values — use .example files instead
+terraform.tfvars
+*.auto.tfvars
+
+# Terraform working directory — created by terraform init
+.terraform/
+.terraform.lock.hcl
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Terraform plan output files — can contain sensitive data
+*.tfplan
+
+# macOS
+.DS_Store
+
+# Editor directories
+.idea/
+.vscode/
+*.swp

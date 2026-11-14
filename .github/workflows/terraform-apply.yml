@@ -1,0 +1,127 @@
+# =============================================================================
+# Terraform Apply (Controlled Deployment)
+# =============================================================================
+# Triggered manually from the Actions tab after a PR is merged to main.
+# Downloads the exact binary plan artifact produced by the PR validation run,
+# verifies it came from the correct commit, then applies it after manual
+# approval through a GitHub Environment gate.
+#
+# IMPORTANT: This workflow never generates a new plan. It applies only the
+# artifact that was reviewed and approved during the PR.
+# =============================================================================
+
+name: Terraform Apply (Deploy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy"
+        required: true
+        type: choice
+        options: [primary, secondary, global]
+      plan_run_id:
+        description: "GitHub Actions run ID that produced the approved plan artifact"
+        required: true
+        type: string
+      expected_sha:
+        description: "Git commit SHA the plan was generated from (for verification)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read   # Required to download artifacts from another run
+
+jobs:
+  verify-and-apply:
+    name: Apply — ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+
+    # GitHub Environment gate — requires a manual approval reviewer configured
+    # in Settings → Environments → production.
+    environment: production
+
+    concurrency:
+      # Exclusive lock per environment state. Blocks concurrent plans and drift checks.
+      group: tf-state-${{ inputs.environment }}
+      cancel-in-progress: false
+
+    env:
+      TF_VERSION: "1.7.5"
+      WORKING_DIR: >-
+        ${{
+          inputs.environment == 'primary'   && 'aetherpay/environments/primary'  ||
+          inputs.environment == 'secondary' && 'aetherpay/environments/secondary' ||
+          'aetherpay/global'
+        }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.expected_sha }}
+
+      # ------------------------------------------------------------------
+      # Verify the current HEAD matches the SHA the plan was built from.
+      # This prevents applying a plan that was generated against a different
+      # commit than what is currently checked out.
+      # ------------------------------------------------------------------
+      - name: Verify commit SHA
+        run: |
+          CURRENT_SHA=$(git rev-parse HEAD)
+          if [ "$CURRENT_SHA" != "${{ inputs.expected_sha }}" ]; then
+            echo "ERROR: Checked-out SHA ($CURRENT_SHA) does not match expected SHA (${{ inputs.expected_sha }})."
+            exit 1
+          fi
+          echo "SHA verified: $CURRENT_SHA"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: tf-apply-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+        working-directory: ${{ env.WORKING_DIR }}
+
+      # ------------------------------------------------------------------
+      # Download the exact binary plan that was reviewed in the PR.
+      # The artifact name encodes both the environment and the commit SHA,
+      # so a plan from a different commit cannot be accidentally applied.
+      # ------------------------------------------------------------------
+      - name: Download approved plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ inputs.expected_sha }}
+          path: ${{ env.WORKING_DIR }}
+          run-id: ${{ inputs.plan_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify plan artifact exists
+        run: |
+          if [ ! -f tfplan.binary ]; then
+            echo "ERROR: Plan artifact not found. Aborting."
+            exit 1
+          fi
+          echo "Plan artifact found."
+        working-directory: ${{ env.WORKING_DIR }}
+
+      # ------------------------------------------------------------------
+      # Show what will be applied before committing.
+      # This is a read-only show — it does not modify state.
+      # ------------------------------------------------------------------
+      - name: Terraform Show (pre-apply review)
+        run: terraform show -no-color tfplan.binary
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -no-color tfplan.binary
+        working-directory: ${{ env.WORKING_DIR }}

@@ -1,0 +1,173 @@
+# =============================================================================
+# Terraform PR Validation
+# =============================================================================
+# Runs on every pull request that touches Terraform files.
+# Steps: fmt → validate → tflint → trivy security scan → plan
+# The workflow fails on any formatting, validation, lint, or critical security issue.
+# =============================================================================
+
+name: Terraform Plan (PR Validation)
+
+on:
+  pull_request:
+    paths:
+      - "aetherpay/**"
+    branches:
+      - main
+
+permissions:
+  id-token: write   # Required for OIDC token exchange
+  contents: read
+  pull-requests: write  # Required to post plan summary as a PR comment
+
+concurrency:
+  # One validation run per PR. Cancels a superseded run when a new commit is pushed.
+  group: tf-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.7.5"
+  TFLINT_VERSION: "v0.50.3"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Shared checks — fmt and tflint run once across the whole repo
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Format & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+        working-directory: aetherpay
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: TFLint — primary
+        run: |
+          tflint --init
+          tflint --chdir=environments/primary
+        working-directory: aetherpay
+
+      - name: TFLint — secondary
+        run: tflint --chdir=environments/secondary
+        working-directory: aetherpay
+
+      - name: TFLint — global
+        run: tflint --chdir=global
+        working-directory: aetherpay
+
+  # ---------------------------------------------------------------------------
+  # Security scan — Trivy scans all Terraform directories
+  # ---------------------------------------------------------------------------
+  security:
+    name: Security Scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy IaC scan
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          scan-type: config
+          scan-ref: aetherpay
+          exit-code: "1"          # Fail the job on CRITICAL or HIGH findings
+          severity: CRITICAL,HIGH
+          format: table
+
+  # ---------------------------------------------------------------------------
+  # Per-environment plan jobs
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan — ${{ matrix.env }}
+    runs-on: ubuntu-latest
+    needs: [lint, security]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: primary
+            working_dir: aetherpay/environments/primary
+            state_key: primary/terraform.tfstate
+            concurrency_group: tf-state-primary
+          - env: secondary
+            working_dir: aetherpay/environments/secondary
+            state_key: secondary/terraform.tfstate
+            concurrency_group: tf-state-secondary
+          - env: global
+            working_dir: aetherpay/global
+            state_key: global/terraform.tfstate
+            concurrency_group: tf-state-global
+
+    concurrency:
+      # Prevent a plan from running while an apply or drift check holds the same state.
+      group: ${{ matrix.concurrency_group }}
+      cancel-in-progress: false   # Queue rather than cancel — do not skip plans
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: tf-plan-${{ matrix.env }}-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+        working-directory: ${{ matrix.working_dir }}
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: ${{ matrix.working_dir }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -input=false \
+            -no-color \
+            -out=tfplan.binary \
+            2>&1 | tee plan.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        working-directory: ${{ matrix.working_dir }}
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.env }}-${{ github.sha }}
+          path: ${{ matrix.working_dir }}/tfplan.binary
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Post plan summary to PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ matrix.working_dir }}/plan.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.slice(0, 60000) + '\n...(truncated)' : plan;
+            const body = `### Terraform Plan — \`${{ matrix.env }}\`\n\`\`\`\n${truncated}\n\`\`\``;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });

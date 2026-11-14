@@ -1,0 +1,170 @@
+# =============================================================================
+# Terraform Drift Detection
+# =============================================================================
+# Runs daily at 06:00 UTC and on manual dispatch.
+# Detects infrastructure drift by running terraform plan -detailed-exitcode.
+#
+# Exit code semantics:
+#   0 — No changes. Infrastructure matches state.
+#   1 — Terraform execution error.
+#   2 — Changes detected. Drift exists.
+#
+# Drift is reported via GitHub Actions summary and optionally via Slack.
+# Drift is NEVER automatically corrected.
+# =============================================================================
+
+name: Terraform Drift Detection
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: "1.7.5"
+
+jobs:
+  drift:
+    name: Drift — ${{ matrix.env }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: primary
+            working_dir: aetherpay/environments/primary
+            concurrency_group: tf-state-primary
+          - env: secondary
+            working_dir: aetherpay/environments/secondary
+            concurrency_group: tf-state-secondary
+          - env: global
+            working_dir: aetherpay/global
+            concurrency_group: tf-state-global
+
+    concurrency:
+      # Shares the same group as apply — prevents drift detection from running
+      # while an apply is in progress against the same state file.
+      group: ${{ matrix.concurrency_group }}
+      cancel-in-progress: false
+
+    outputs:
+      # GitHub Actions matrix outputs: the last matrix job to finish wins.
+      # The notify job therefore checks the overall job result instead of
+      # individual per-environment outputs, which is more reliable.
+      drift_detected: ${{ steps.plan.outputs.drift }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: tf-drift-${{ matrix.env }}-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+        working-directory: ${{ matrix.working_dir }}
+
+      # ------------------------------------------------------------------
+      # Run plan with -detailed-exitcode.
+      # Exit code 2 means drift — capture it without failing the step so
+      # we can handle each code explicitly below.
+      # ------------------------------------------------------------------
+      - name: Terraform Plan (drift check)
+        id: plan
+        run: |
+          set +e
+          terraform plan \
+            -detailed-exitcode \
+            -input=false \
+            -no-color \
+            -refresh=true \
+            2>&1 | tee drift-report.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          case $EXIT_CODE in
+            0)
+              echo "drift=false" >> "$GITHUB_OUTPUT"
+              echo "### ✅ No drift detected — ${{ matrix.env }}" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            2)
+              echo "drift=true" >> "$GITHUB_OUTPUT"
+              echo "### ⚠️ Drift detected — ${{ matrix.env }}" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              cat drift-report.txt >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "drift=error" >> "$GITHUB_OUTPUT"
+              echo "### ❌ Terraform error — ${{ matrix.env }}" >> "$GITHUB_STEP_SUMMARY"
+              cat drift-report.txt >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
+        working-directory: ${{ matrix.working_dir }}
+
+      - name: Upload drift report
+        if: steps.plan.outputs.drift == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report-${{ matrix.env }}-${{ github.run_id }}
+          path: ${{ matrix.working_dir }}/drift-report.txt
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Slack notification — runs after all matrix jobs complete
+  # Only fires when at least one environment has drift.
+  # Requires the SLACK_DRIFT_WEBHOOK_URL secret to be configured.
+  # If the secret is absent the step is skipped gracefully.
+  # ---------------------------------------------------------------------------
+  notify:
+    name: Notify on Drift
+    runs-on: ubuntu-latest
+    needs: drift
+    # Trigger when any matrix job failed (exit code 1) or detected drift (exit code 2).
+    # needs.drift.result == 'failure' covers exit code 1 (Terraform error).
+    # needs.drift.result == 'success' with drift_detected == 'true' covers exit code 2.
+    if: |
+      always() &&
+      (
+        needs.drift.result == 'failure' ||
+        needs.drift.outputs.drift_detected == 'true'
+      )
+    steps:
+      - name: Send Slack alert
+        if: ${{ secrets.SLACK_DRIFT_WEBHOOK_URL != '' }}
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          PAYLOAD=$(cat <<EOF
+          {
+            "text": ":warning: *AetherPay Terraform Drift Detected*",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ":warning: *Terraform drift detected in AetherPay infrastructure.*\nOne or more environments no longer match their Terraform state.\n<${RUN_URL}|View full drift report>"
+                }
+              }
+            ]
+          }
+          EOF
+          )
+          curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "${{ secrets.SLACK_DRIFT_WEBHOOK_URL }}"

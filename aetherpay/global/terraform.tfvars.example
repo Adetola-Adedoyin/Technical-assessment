@@ -1,0 +1,28 @@
+# =============================================================================
+# Global — Example Variable Values
+# =============================================================================
+# Copy this file to terraform.tfvars and fill in the real ALB values.
+#
+# HOW TO GET THE ALB VALUES:
+#   cd environments/primary
+#   terraform output alb_dns_name    → paste into primary_alb_dns_name
+#   terraform output alb_zone_id     → paste into primary_alb_zone_id
+#
+#   cd environments/secondary
+#   terraform output alb_dns_name    → paste into secondary_alb_dns_name
+#   terraform output alb_zone_id     → paste into secondary_alb_zone_id
+# =============================================================================
+
+project_name      = "aetherpay"
+domain_name       = "adetola.com"
+app_subdomain     = "app"
+health_check_path = "/health"
+dns_ttl           = 60
+
+# Primary environment ALB — replace with real values from terraform output
+primary_alb_dns_name = "aetherpay-primary-alb-123456789.us-east-1.elb.amazonaws.com"
+primary_alb_zone_id  = "Z35SXDOTRQ7X7K"
+
+# Secondary environment ALB — replace with real values from terraform output
+secondary_alb_dns_name = "aetherpay-secondary-alb-987654321.us-west-2.elb.amazonaws.com"
+secondary_alb_zone_id  = "Z1H1FL5HABSF5"

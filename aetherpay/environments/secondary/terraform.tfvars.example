@@ -1,0 +1,35 @@
+# =============================================================================
+# Secondary Environment — Example Variable Values
+# =============================================================================
+# Copy this file to terraform.tfvars and fill in real values.
+# Do NOT commit terraform.tfvars to source control if it contains secrets.
+# =============================================================================
+
+aws_region   = "us-west-2"
+project_name = "aetherpay"
+environment  = "secondary"
+
+# Networking
+vpc_cidr                 = "10.25.0.0/20"
+public_subnet_cidrs      = ["10.25.0.0/24", "10.25.1.0/24", "10.25.2.0/24"]
+private_app_subnet_cidrs = ["10.25.4.0/24", "10.25.5.0/24", "10.25.6.0/24"]
+isolated_db_subnet_cidrs = ["10.25.8.0/24", "10.25.9.0/24", "10.25.10.0/24"]
+
+# ECS — replace with the replicated ECR image URI in us-west-2
+container_image_uri = "123456789012.dkr.ecr.us-west-2.amazonaws.com/aetherpay:latest"
+ecs_task_cpu        = 512
+ecs_task_memory     = 1024
+ecs_desired_count   = 2
+ecs_min_count       = 2
+ecs_max_count       = 10
+
+# ALB — replace with your real ACM certificate ARN for us-west-2
+acm_certificate_arn = "arn:aws:acm:us-west-2:123456789012:certificate/REPLACE-WITH-REAL-CERT-ARN"
+
+# Aurora
+aurora_instance_class = "db.r6g.large"
+
+# Autoscaling thresholds
+cpu_scale_out_threshold    = 70
+memory_scale_out_threshold = 80
+sqs_scale_out_threshold    = 100
